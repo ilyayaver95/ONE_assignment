@@ -1,0 +1,116 @@
+{
+  "_comment": "Side-car enrichment, keyed by the English parameter name used in the assignment's parameters.json. Anything not listed here falls back to _default, so an unfamiliar parameter still works end-to-end.",
+  "_default": {
+    "family": "atomic",
+    "keywords": [],
+    "max_pages": 4,
+    "hebrew_name": "",
+    "description": ""
+  },
+  "client_name": {
+    "family": "metadata",
+    "keywords": [
+      "המזמין",
+      "עורך המכרז",
+      "מפרסם",
+      "תאגיד",
+      "עירייה",
+      "מועצה",
+      "רשות",
+      "חברה"
+    ],
+    "max_pages": 2,
+    "hebrew_name": "שם המזמין",
+    "description": "שם הגוף שפרסם את המכרז (רשות, תאגיד, עירייה, חברה)."
+  },
+  "tender_name": {
+    "family": "metadata",
+    "keywords": [
+      "מכרז",
+      "מכרז פומבי",
+      "מכרז מס",
+      "דו-שלבי",
+      "פומבי"
+    ],
+    "max_pages": 2,
+    "hebrew_name": "שם המכרז",
+    "description": "השם המלא של המכרז, כולל מספר המכרז וסוגו (פומבי, דו-שלבי וכו')."
+  },
+  "threshold_conditions": {
+    "family": "list_or_table",
+    "keywords": [
+      "תנאי סף",
+      "תנאים מוקדמים",
+      "כשירות",
+      "רשאי להשתתף",
+      "עמידה בתנאים",
+      "ניסיון קודם",
+      "רישיון",
+      "סיווג"
+    ],
+    "max_pages": 6,
+    "hebrew_name": "תנאי סף",
+    "description": "דרישות חובה להשתתפות במכרז: ניסיון, ותק, עמידה בחוקים, רישוי, סיווג, מחזור כספי."
+  },
+  "contract_period": {
+    "family": "atomic",
+    "keywords": [
+      "תקופת ההתקשרות",
+      "תקופת החוזה",
+      "תקופת השירות",
+      "אופציה",
+      "הארכה",
+      "חודשים",
+      "שנים"
+    ],
+    "max_pages": 3,
+    "hebrew_name": "תקופת ההתקשרות",
+    "description": "משך ההתקשרות עם הזוכה, וכן אופציות להארכה ותנאיהן."
+  },
+  "evaluation_method": {
+    "family": "list_or_table",
+    "keywords": [
+      "אמות מידה",
+      "שיטת ההערכה",
+      "מפ\"ל",
+      "מפל",
+      "ניקוד",
+      "משקל",
+      "איכות",
+      "מחיר",
+      "שקלול",
+      "ציון"
+    ],
+    "max_pages": 5,
+    "hebrew_name": "שיטת ההערכה (מפ\"ל)",
+    "description": "אופן שקלול ההצעות: משקל המחיר מול משקל האיכות, אמות מידה, ניקוד וציון משוקלל."
+  },
+  "bid_guarantee": {
+    "family": "atomic",
+    "keywords": [
+      "ערבות",
+      "ערבות מכרז",
+      "ערבות הגשה",
+      "ערבות בנקאית",
+      "כתב ערבות",
+      "בטוחה",
+      "תוקף הערבות",
+      "חילוט"
+    ],
+    "max_pages": 4,
+    "hebrew_name": "ערבות מכרז",
+    "description": "ערבות ההגשה: סכום, סוג הערבות, תנאי חילוט ותוקף."
+  },
+  "idea_author": {
+    "family": "atomic",
+    "keywords": [
+      "הוגה הרעיון",
+      "יוזם",
+      "ממציא",
+      "רעיון"
+    ],
+    "max_pages": 3,
+    "hebrew_name": "הוגה הרעיון",
+    "description": "מי הגה את הרעיון שבבסיס המכרז."
+  }
+}
