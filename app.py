@@ -199,19 +199,58 @@ def render_monitoring() -> None:
 
     quality_col, econ_col = st.columns(2)
     with quality_col:
-        st.caption("Answer quality per run — found & grounded (of 7)")
+        st.markdown("**Answer quality** — `found` and `grounded`, of 7")
+        st.caption("found = parameters with a non-empty answer. grounded = the model's verbatim "
+                   "quote really appears on the pages it cites (deterministic check — the "
+                   "hallucination guard). A gap between the lines means answers whose citation "
+                   "could not be verified; found=0 means the model produced nothing usable.")
         st.line_chart(frame, x="run", y=["found", "grounded"], height=220)
     with econ_col:
-        st.caption("Economy per run — avg pages sent per parameter")
+        st.markdown("**Economy** — avg pages sent per parameter")
+        st.caption("The assignment's explicit goal: how few pages each answer needed, out of the "
+                   "whole document. Flat ≈3 across providers and documents means the router — not "
+                   "the model — controls cost. A jump here would mean routing degraded.")
         st.line_chart(frame, x="run", y=["avg_pages"], height=220)
 
     tok_col, call_col = st.columns(2)
     with tok_col:
-        st.caption("Tokens per run")
+        st.markdown("**Tokens per run** — input / output")
+        st.caption("What the run actually paid. Input dominates and tracks cache state, not "
+                   "model quality: a cold run re-reads every page, a warm one only pays for "
+                   "extraction. Compare runs on the same document to see caching work.")
         st.line_chart(frame, x="run", y=["input_tokens", "output_tokens"], height=220)
     with call_col:
-        st.caption("LLM calls vs cache hits per run")
+        st.markdown("**Calls vs cache hits**")
+        st.caption("Of ~95 calls per run, up to 81 are page-tags servable from the SQLite cache. "
+                   "cache_hits near llm_calls = a warm re-run costing only the 14 extraction/judge "
+                   "calls; cache_hits at 0 = first contact with this document+model pair.")
         st.line_chart(frame, x="run", y=["llm_calls", "cache_hits"], height=220)
+
+    # ── a computed reading of the data on screen, not canned text ──
+    best = frame.loc[frame["found"].idxmax()]
+    worst = frame.loc[frame["found"].idxmin()]
+    err_runs = frame[frame["errors"] > 0]
+    warm = frame[frame["cache_hits"] > 0]
+    lines = [
+        f"**Best run:** #{best['run']} ({best['provider']} · {best['pdf']}) — "
+        f"{best['found']}/7 found, {best['grounded']}/7 grounded.",
+        f"**Worst run:** #{worst['run']} ({worst['provider']}) — {worst['found']}/7 found. "
+        + ("Its `errors` column is non-zero, so this is quota/transport failure, not model "
+           "opinion — failed calls are never disguised as 'not found'."
+           if worst["errors"] > 0 else
+           "Zero failed calls — the model genuinely found nothing; see `absence_contested` "
+           "in its diagnostics for whether the tagger disagreed."),
+    ]
+    if len(err_runs):
+        lines.append(f"**{len(err_runs)} of {len(frame)} runs had failed calls** (⚠ quota or "
+                     "transport). Their low scores measure availability, not extraction quality.")
+    if len(warm):
+        saved = int((warm["cache_hits"] / warm["llm_calls"]).mean() * 100)
+        lines.append(f"**Caching:** {len(warm)} warm runs served ~{saved}% of their calls from "
+                     "the page-tag cache — the 'tag once, route many' economics, visible live.")
+    st.markdown("#### Reading the current data")
+    for line in lines:
+        st.markdown("- " + line)
 
     st.caption("Every run, newest first. `elapsed_s` is empty on rows backfilled "
                "from artifacts that predate the registry.")

@@ -1781,6 +1781,8 @@ async def process_document(
     started = time.time()
     say = on_stage or (lambda message: None)
 
+    CALLS.clear()          # per-run ledger: a second document in the same process
+                           # must not inherit the first one's token accounting
     conn = init_storage()
     llm = llm or setup_llm()
     provider = llm.provider
