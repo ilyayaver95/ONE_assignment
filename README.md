@@ -47,7 +47,6 @@ pip install -r requirements.txt
 echo "GEMINI_API_KEY=your_key" > .env        # and/or ANTHROPIC_API_KEY=...
 
 python solution.py --pdf path/to/any_tender.pdf              # any tender PDF
-python solution.py --ablation                                # routed vs whole-document cost
 python solution.py --provider anthropic                      # Claude instead of Gemini
 
 streamlit run app.py                # web UI: upload any PDF + the Monitoring tab

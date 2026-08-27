@@ -1,13 +1,51 @@
 """
 Tender parameter extraction — page-level structured routing.
 
-Instead of sending an entire tender to an LLM for every parameter, the document is cut into
-pages, each page is tagged once, and each parameter is routed to the few pages that can answer
-it. Only those pages are sent for extraction.
+WHAT THIS DOES
+    Reads a Hebrew tender PDF (a מכרז) and, for a list of parameters (e.g. "bid
+    guarantee amount", "contract period"), returns the value, an explanation, which
+    page(s) it came from, and a 1-5 certainty score — written to output/results.json.
 
-    PDF -> pages -> prefilter -> tag -> match -> extract -> verify -> output
+WHY NOT JUST PASTE THE WHOLE PDF INTO THE PROMPT
+    That works, but it is expensive (the same document is re-read for every
+    parameter) and imprecise (the model has to find one needle in a hundred-page
+    haystack). Instead: read the document ONCE, decide which few pages are relevant
+    to EACH parameter, and only send those pages when asking the actual question.
 
-Run:  python solution.py
+THE PIPELINE, IN THE ORDER IT RUNS (see the numbered "# N." section headers below)
+    1. Provider     — a tiny interface so Gemini / Anthropic / a local model are
+                       interchangeable; the rest of the file never imports an SDK.
+    2. Cache        — every page is tagged once and the result is saved to disk
+                       (output/cache.sqlite), so re-running the same document costs $0.
+    3. Ingest       — PDF -> Page objects: fix RTL text, strip repeated headers,
+                       detect the cover page, etc. No LLM calls, all free.
+    4. Prefilter    — a cheap keyword pass that narrows which pages are worth an
+                       LLM's attention (never the FINAL decision, just a cost cut).
+    5. Tag          — the one expensive step: ask an LLM, once per page, "how
+                       relevant is this page to each parameter?" (score 0-3).
+    6. Match        — turn those per-page scores into "parameter -> best pages"
+                       using plain Python, no LLM call.
+    7. Extract      — for each parameter, send only its matched pages and ask for
+                       the actual value.
+    8. Verify       — sanity-check each answer two ways: (a) does the quoted text
+                       really appear on the cited page (no LLM, just string search),
+                       and (b) does a SECOND, independent model reading the same
+                       pages agree with the first answer?
+    9. Output       — assemble the result dict in the exact shape required, plus a
+                       separate diagnostics file with everything else (for humans).
+
+DATA FLOW (the type each stage produces, feeding the next)
+    PDF -> list[Page] -> dict[page_number, PageTags] -> dict[parameter, list[page]]
+        -> list[Extraction] -> results.json
+
+HOW TO RUN
+    python solution.py                                    # the shipped example PDF
+    python solution.py --pdf path/to/other_tender.pdf      # any tender PDF
+    streamlit run app.py                                   # a small web UI + monitoring
+
+Every run also appends one line to output/runs.jsonl (see record_run, near the
+bottom) — that is what the Streamlit app's "Monitoring" tab reads to show trends
+across runs (tokens spent, answers found, grounded, etc.) without re-running anything.
 """
 
 from __future__ import annotations
@@ -406,7 +444,8 @@ class StubProvider:
     """Returns schema-valid empty objects so the whole pipeline runs with no API key."""
 
     async def complete(self, prompt: str, schema: type[T], model: str) -> tuple[T, Usage]:
-        await asyncio.sleep(0)
+        # No real I/O to await — this only exists to satisfy the Provider protocol
+        # (an async method, so the caller can `await` it uniformly with the real ones).
         return schema(), Usage(model=f"stub:{model}")
 
     def count_tokens(self, text: str, model: str) -> int:
@@ -466,6 +505,7 @@ CALLS: list[Usage] = []
 
 
 def init_storage(db_path: Path = CACHE_DB) -> sqlite3.Connection:
+    """Open (creating if needed) the one-table SQLite cache: key -> a page's tags."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE IF NOT EXISTS tag_cache (key TEXT PRIMARY KEY, payload TEXT)")
@@ -474,6 +514,9 @@ def init_storage(db_path: Path = CACHE_DB) -> sqlite3.Connection:
 
 
 def cache_key(page: Page, prompt_version: str, model: str) -> str:
+    """A page is 'the same tagging call' only if its text, the prompt, and the model
+    all match a previous run — hashing all three means the cache can never serve a
+    stale answer after any of them changes."""
     import hashlib
 
     material = f"{page.raw_text}|{prompt_version}|{model}".encode("utf-8")
@@ -481,19 +524,37 @@ def cache_key(page: Page, prompt_version: str, model: str) -> str:
 
 
 def cache_get(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
-    row = conn.execute("SELECT payload FROM tag_cache WHERE key = ?", (key,)).fetchone()
-    return json.loads(row[0]) if row else None
+    """Look up one page's cached tags; None means "never tagged with this key".
+
+    Best-effort, like cache_put: a broken cache reads as a miss, never as a crash.
+    """
+    try:
+        row = conn.execute("SELECT payload FROM tag_cache WHERE key = ?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+    except sqlite3.Error:
+        return None
 
 
 def cache_put(conn: sqlite3.Connection, key: str, payload: dict[str, Any]) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO tag_cache (key, payload) VALUES (?, ?)",
-        (key, json.dumps(payload, ensure_ascii=False)),
-    )
-    conn.commit()
+    """Save one page's tags so the next run with the same key skips the LLM call.
+
+    Best-effort: the cache is an optimization, so a failed write (disk full, the
+    .sqlite file deleted or locked by another process mid-run) must never crash the
+    pipeline — the run simply proceeds uncached and pays again next time.
+    """
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO tag_cache (key, payload) VALUES (?, ?)",
+            (key, json.dumps(payload, ensure_ascii=False)),
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        print(f"    ! cache write failed ({exc}) — continuing without caching this page")
 
 
 def record(usage: Usage) -> None:
+    """Log one LLM call's token cost into the run-wide list CALLS reads back from
+    when it builds the diagnostics/monitoring numbers at the end of the run."""
     CALLS.append(usage)
 
 
@@ -1380,7 +1441,14 @@ async def extract_all(
             print(f"    !! {spec.name}: extraction FAILED — reported as an error, "
                   f"not as 'not found'")
 
+        # "Found" requires all three: the call succeeded, the model itself said
+        # status="found" (not "not_found"), AND it actually wrote a non-empty answer
+        # — a model can say "found" and then leave the answer blank, which must not
+        # count as a real answer.
         found = ok and value.status == "found" and bool(value.answer.strip())
+        # Trust the model's cited pages only if they are pages we actually sent it
+        # (source_pages ∩ numbers); if it cited nothing usable, fall back to "every
+        # page we sent" rather than an empty citation.
         cited = [n for n in value.source_pages if n in numbers] or numbers
         return Extraction(
             parameter=spec.name,
@@ -1745,6 +1813,8 @@ def record_run(outcome: dict[str, Any], llm: "LLMSetup", pdf_path: Path) -> None
 
 
 def save_and_print(results: dict[str, Any], path: Path, label: str) -> None:
+    """Write one JSON file to output/ and echo it to the console, so a run is
+    visible both on disk and in the terminal without opening a file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n=== {label} -> {path} ===")
@@ -1752,6 +1822,8 @@ def save_and_print(results: dict[str, Any], path: Path, label: str) -> None:
 
 
 def report_kpis(elapsed: float, diagnostics: dict[str, Any]) -> None:
+    """Console summary printed at the end of every run — the human-readable version
+    of the same numbers record_run() saves into output/runs.jsonl for Monitoring."""
     print("\n=== KPIs ===")
     print(f"  wall clock            : {elapsed:.1f}s")
     print(f"  avg pages / parameter : {diagnostics['avg_pages_sent']}")
@@ -1783,50 +1855,86 @@ async def process_document(
 
     CALLS.clear()          # per-run ledger: a second document in the same process
                            # must not inherit the first one's token accounting
+    # init_storage(): opens (or creates) output/cache.sqlite, the page-tag cache.
     conn = init_storage()
+    # setup_llm(): picks a provider from whichever API key is in the environment,
+    # and returns the model name for each role (tagger / extractor / judge).
     llm = llm or setup_llm()
     provider = llm.provider
 
     say("reading parameters")
+    # load_parameters(): reads data/parameters.json (the list of what to extract)
+    # and merges each one with its optional side-car config from param_config.json.
     specs = load_parameters()
 
     say("reading the PDF")
+    # load_document(): PyMuPDF -> one Page per physical page, with RTL/letter-spacing
+    # already repaired so every later stage reads clean text.
     pages = load_document(pdf_path)
+    # detect_boilerplate(): finds lines that repeat across most pages (a running
+    # header/footer stamp), so they can be read once instead of on every page.
     boilerplate = detect_boilerplate(pages)
+    # build_document_meta(): reassembles that repeated stamp into one header record,
+    # IF the document actually has one (has_running_header decides that later).
     meta = build_document_meta(pages, boilerplate)
+    # strip_boilerplate(): removes the repeated stamp from each page's body_text.
+    # enrich_pages_structurally(): adds free, deterministic per-page facts (cover?
+    # table-of-contents? appendix? does it have a table?) used later for routing.
     pages = enrich_pages_structurally(strip_boilerplate(pages, boilerplate))
 
     say(f"tagging {len(pages)} pages (slowest step — cached after the first run)")
+    # lexical_prefilter(): a cheap keyword pass — which pages even mention a
+    # parameter's vocabulary at all. Only used to shorten the LLM prompt below,
+    # never to drop a page outright.
     candidates = lexical_prefilter(pages, specs)
+    # tag_pages(): the expensive step — one LLM call per page (cached), asking
+    # "how relevant is this page to each parameter?" (score 0-3, with evidence).
     tags = await tag_pages(pages, specs, candidates, provider, conn, model=llm.models["tagger"])
 
     say("routing parameters to pages")
+    # match_parameters_to_pages(): turns those per-page scores into "parameter ->
+    # its best few pages", no LLM call — plain ranking over data already in hand.
     page_map = match_parameters_to_pages(tags, specs, pages, meta, candidates=candidates)
     budgets = {spec.name: spec.max_pages for spec in specs}
+    # expand_windows_if_truncated(): if a routed page's text is cut off mid-sentence
+    # (a clause or list continuing onto the next page), pull that next page in too.
     page_map = {
         name: expand_windows_if_truncated(numbers, pages)[: budgets.get(name, MAX_PAGES_PER_PARAM)]
         for name, numbers in page_map.items()
     }
 
     say("extracting values")
+    # extract_all(): one LLM call PER PARAMETER, sending only that parameter's
+    # routed pages, asking for the actual value (not just "is it relevant").
     extractions = await extract_all(page_map, pages, specs, provider, meta,
                                     model=llm.models["extractor"], fallbacks=llm.fallbacks)
 
+    # attach_absence_evidence(): for a parameter that came back "not found", copy in
+    # the tagger's own evidence quote — so an absence can be double-checked too.
     extractions = attach_absence_evidence(extractions, tags)
 
     say("verifying with a second model")
+    # verify_and_score(): (a) deterministic check — does the quoted text really sit
+    # on the cited page; (b) a SECOND, independent model re-answers the same
+    # question blind, and the two answers are compared to produce the final score.
     extractions = await verify_and_score(extractions, pages, provider, specs, page_map, meta,
                                          model=llm.models["judge"])
 
     conn.close()
     outcome = {
+        # build_output(): renders the internal Extraction objects down to the exact
+        # {answer, details, source, score} shape the assignment requires.
         "results": build_output(extractions),
         "page_map": page_map,
+        # build_diagnostics(): everything useful that is NOT part of that required
+        # shape (groundedness, agreement, token counts, ...) — kept in a side file.
         "diagnostics": build_diagnostics(extractions, page_map, pages, meta),
         "pages": pages,
         "header": meta.header_text,
         "elapsed": time.time() - started,
     }
+    # record_run(): appends one summary line for this run to output/runs.jsonl —
+    # what the Streamlit app's Monitoring tab reads to show trends over time.
     record_run(outcome, llm, pdf_path)
     return outcome
 
@@ -1835,112 +1943,21 @@ async def run_pipeline(pdf_path: Path = PDF_PATH, prefix: str = "",
                        llm: LLMSetup | None = None) -> None:
     """CLI entry point: run, save, print."""
     print(f"starting... [{pdf_path.name}]")
+    # process_document(): runs every pipeline stage (ingest -> tag -> route ->
+    # extract -> verify) and returns a dict with the results, not yet written to disk.
     outcome = await process_document(pdf_path, on_stage=lambda m: print(f"  {m}"), llm=llm)
 
+    # save_and_print(): writes one JSON file to output/ and echoes it to the console.
     save_and_print(outcome["page_map"], OUTPUT_DIR / f"{prefix}page_map.json", "parameter -> pages")
     save_and_print(outcome["results"], OUTPUT_DIR / f"{prefix}results.json", "results")
     save_and_print(outcome["diagnostics"], OUTPUT_DIR / f"{prefix}diagnostics.json", "diagnostics")
+    # report_kpis(): a short human-readable summary printed at the end of the run.
     report_kpis(outcome["elapsed"], outcome["diagnostics"])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ablation — the experiment that justifies the whole architecture
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def run_ablation(pdf_path: Path = PDF_PATH, llm: LLMSetup | None = None) -> None:
-    """Compare routed extraction against sending the whole document per parameter.
-
-    Token counts are MEASURED via the provider's tokeniser, not estimated from
-    characters — Hebrew tokenises badly under a chars/4 rule. The one-off tagging cost
-    is reported separately and honestly: it is real, it is paid once per document, and
-    it is amortised across every parameter (and every future parameter).
-    """
-    print(f"=== ablation: {pdf_path.name} ===\n")
-
-    pages = load_document(pdf_path)
-    boilerplate = detect_boilerplate(pages)
-    meta = build_document_meta(pages, boilerplate)
-    pages = enrich_pages_structurally(strip_boilerplate(pages, boilerplate))
-    specs = load_parameters()
-
-    conn = init_storage()
-    llm = llm or setup_llm()
-    provider = llm.provider
-    model = llm.models["extractor"]
-
-    candidates = lexical_prefilter(pages, specs)
-    tags = await tag_pages(pages, specs, candidates, provider, conn, model=llm.models["tagger"])
-    page_map = match_parameters_to_pages(tags, specs, pages, meta, candidates=candidates)
-    budgets = {spec.name: spec.max_pages for spec in specs}
-    page_map = {
-        name: expand_windows_if_truncated(nums, pages)[: budgets.get(name, MAX_PAGES_PER_PARAM)]
-        for name, nums in page_map.items()
-    }
-
-    whole_document = "\n\n".join(f"[עמוד {p.number}]\n{p.body_text}" for p in pages)
-
-    rows, routed_total, baseline_total = [], 0, 0
-    for spec in specs:
-        numbers = page_map.get(spec.name, [])
-        routed_prompt = build_extraction_prompt(spec, pages, numbers, meta)
-        baseline_prompt = "\n\n".join([
-            EXTRACTION_SHARED,
-            FAMILY_INSTRUCTIONS.get(spec.family, FAMILY_INSTRUCTIONS["atomic"]),
-            f"הפרמטר לחילוץ: {spec.hebrew_name} ({spec.name})",
-            "הטקסט:", whole_document,
-        ])
-        routed = provider.count_tokens(routed_prompt, model)
-        baseline = provider.count_tokens(baseline_prompt, model)
-        routed_total += routed
-        baseline_total += baseline
-        rows.append((spec.name, len(numbers), routed, baseline))
-
-    # Measured from the prompts, so the number holds whether or not the cache was warm.
-    by_number = {pg.number: pg for pg in pages}
-    with_signal = set().union(*candidates.values()) if candidates else set()
-    tagging_tokens = 0
-    for page in pages:
-        prompt = build_tagging_prompt(
-            page, specs, by_number.get(page.number - 1), by_number.get(page.number + 1),
-            brief=page.number not in with_signal,
-        )
-        tagging_tokens += provider.count_tokens(prompt, llm.models["tagger"])
-    tagging_out = sum(c.output_tokens for c in CALLS) or int(0.17 * tagging_tokens)
-    tagging_tokens += tagging_out
-
-    print(f"{'parameter':24}{'pages':>7}{'routed tok':>12}{'whole-doc tok':>15}{'saving':>9}")
-    for name, n_pages, routed, baseline in rows:
-        saving = 1 - routed / baseline if baseline else 0
-        print(f"{name:24}{n_pages:>7}{routed:>12,}{baseline:>15,}{saving:>8.0%}")
-
-    print(f"\n{'TOTAL extraction':24}{'':>7}{routed_total:>12,}{baseline_total:>15,}"
-          f"{1 - routed_total / baseline_total:>8.0%}")
-    print(f"{'+ one-off tagging':24}{len(pages):>7}{tagging_tokens:>12,}{0:>15,}")
-    print(f"{'= end to end':24}{'':>7}{routed_total + tagging_tokens:>12,}{baseline_total:>15,}"
-          f"{1 - (routed_total + tagging_tokens) / baseline_total:>8.0%}")
-
-    # Where does routing start paying for itself? Tagging is a fixed cost; each extra
-    # parameter costs a few pages routed versus a whole document in the baseline.
-    n = len(specs)
-    per_param_routed = routed_total / n
-    per_param_baseline = baseline_total / n
-    margin = per_param_baseline - per_param_routed
-    break_even = tagging_tokens / margin if margin > 0 else float("inf")
-
-    print(f"\nDocument: {len(pages)} pages, {n} parameters.")
-    print(f"  per parameter : routed {per_param_routed:,.0f} tok vs "
-          f"whole-doc {per_param_baseline:,.0f} tok")
-    print(f"  break-even    : {break_even:.1f} parameters "
-          f"— beyond this, routing is cheaper even counting tagging")
-    print(f"  at {n} parameters the routed path saves "
-          f"{baseline_total - routed_total - tagging_tokens:,} tokens")
-    print("  tagging is paid ONCE per document and reused by every parameter, including")
-    print("  parameters added later — the baseline pays a full document every time.")
-    print(f"  re-runs hit the page-tag cache, so a second pass costs {routed_total:,} tokens.")
-    conn.close()
-
-
 def parse_args() -> argparse.Namespace:
+    """Command-line options for `python solution.py`. Run with --help to see these
+    from the terminal."""
     parser = argparse.ArgumentParser(
         description="Extract tender parameters by routing each one to its relevant pages."
     )
@@ -1948,8 +1965,6 @@ def parse_args() -> argparse.Namespace:
                         help="tender PDF to process")
     parser.add_argument("--prefix", default="",
                         help="prefix for output files, e.g. 'test_' for the holdout")
-    parser.add_argument("--ablation", action="store_true",
-                        help="measure routed vs whole-document cost instead of extracting")
     parser.add_argument("--provider", choices=["gemini", "anthropic", "local"], default=None,
                         help="LLM provider (default: whichever API key the environment has; "
                              "'local' talks to LM Studio at LMSTUDIO_BASE_URL or localhost:1234)")
@@ -1957,19 +1972,25 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Entry point for `python solution.py`. Loads the API key from .env (if present),
+    reads the --pdf/--prefix/--provider flags, and runs the pipeline once, start to
+    finish. See run_pipeline() and, inside it, process_document() for what "runs"
+    actually means."""
     try:
         from dotenv import load_dotenv
 
+        # load_dotenv(): reads .env in this project's folder and puts GEMINI_API_KEY /
+        # ANTHROPIC_API_KEY into the environment, so setup_llm() below can find them.
         load_dotenv(ROOT / ".env")
     except ImportError:
         pass
 
+    # parse_args(): reads --pdf / --prefix / --provider from the command line.
     args = parse_args()
+    # setup_llm(): resolves which provider + models to use for this run.
     llm = setup_llm(args.provider)
-    if args.ablation:
-        asyncio.run(run_ablation(args.pdf, llm=llm))
-    else:
-        asyncio.run(run_pipeline(args.pdf, args.prefix, llm=llm))
+    # run_pipeline(): does the actual work — see above.
+    asyncio.run(run_pipeline(args.pdf, args.prefix, llm=llm))
 
 
 if __name__ == "__main__":
