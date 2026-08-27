@@ -58,7 +58,8 @@ empty answers) — useful for testing the plumbing, and announced loudly on the 
 
 Outputs land in `output/`: `results.json` (the required contract), `page_map.json`
 (`parameter → [pages]`), `diagnostics.json` (metrics kept out of the contract), and
-`runs.jsonl` — one line per run, appended automatically (see Monitoring).
+`runs.jsonl` — one line per run, appended automatically (see Monitoring). The folder starts
+empty; the first run creates everything.
 
 ## 1 · EDA — read the document before the model does
 
@@ -178,8 +179,7 @@ Three findings the comparison produced, worth more than the table:
 Four more models were tested and failed for four *different*, diagnosed reasons — Groq free-tier
 quota (org-wide), Llama-3.1-8B refusing to commit (`absence_contested` caught all six false
 absences), qwen3.5-9B's serving stack corrupting constrained output, gemma-4-12B's 15 tok/s ×
-verbose JSON ≈ hours. Full seven-model matrix: `output/provider_comparison_final.html` · clean
-three-way: `output/provider_comparison_3way.html`.
+verbose JSON ≈ hours.
 
 ## 5 · Results II — vs the naive baselines
 
@@ -273,11 +273,10 @@ pays for the whole document on every question, forever.
 ```
 solution.py             the whole pipeline, main() calling small functions
 app.py                  Streamlit UI: extraction + Monitoring tab
-build_comparison.py     renders provider comparisons from recorded runs (never recomputes)
 param_config.json       per-parameter gazetteer, prompt family, page budget
 data/                   example tenders, their parameters.json, reference answers
-output/                 results, page map, diagnostics, tag cache, runs.jsonl, comparison pages
-PLAN.md · REVIEW.md     architecture log · adversarial self-review
+docs/img/               the figures embedded above
+output/                 created per run: results, page map, diagnostics, tag cache, runs.jsonl
 ```
 
 No page numbers, document-specific regexes or tuned constants live in the functions — everything
